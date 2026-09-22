@@ -32,7 +32,9 @@ class AdCloserService : AccessibilityService() {
             val id=(n.viewIdResourceName ?: "").lowercase()
             val textMatch=t in words || d in words
             val idMatch=ids.any { id.endsWith("/$it") || id.contains(it) }
-            if((textMatch || idMatch) && n.boundsInScreen.let { r -> n.getBoundsInScreen(r); r.width()>0 && r.height()>0 }) return n
+            val bounds = android.graphics.Rect()
+            n.getBoundsInScreen(bounds)
+            if((textMatch || idMatch) && bounds.width()>0 && bounds.height()>0) return n
         }
         for(i in 0 until n.childCount) n.getChild(i)?.let { find(it)?.let { h -> return h } }
         return null
