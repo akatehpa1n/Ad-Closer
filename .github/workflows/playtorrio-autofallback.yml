@@ -241,12 +241,10 @@ jobs:
           )
 
           replace_once(
-              """  void _switchStream(StreamSource newSource, Video newEpisode) async {
-            _progressSaveTimer?.cancel();""",
+              "  void _switchStream(StreamSource newSource, Video newEpisode) async {",
               """  void _switchStream(StreamSource newSource, Video newEpisode) async {
             _failedSourceKeys.clear();
-            _autoFallbackCount = 0;
-            _progressSaveTimer?.cancel();""",
+            _autoFallbackCount = 0;""",
               "manual switch reset",
           )
 
