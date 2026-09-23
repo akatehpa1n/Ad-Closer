@@ -255,28 +255,18 @@ jobs:
           )
 
           replace_once(
-              """    // 4. Critical error on dead stream
-            print('[PlayerScreen ERROR] Critical player error on dead stream: $errorMsg');
-
-            if (_currentEpisode != null && widget.detail?.videos.isNotEmpty == true) {""",
-              """    // 4. Critical error on dead stream
-            print('[PlayerScreen ERROR] Critical player error on dead stream: $errorMsg');
+              "    print('[PlayerScreen ERROR] Critical player error on dead stream: $errorMsg');",
+              """    print('[PlayerScreen ERROR] Critical player error on dead stream: $errorMsg');
 
             if (await _tryNextSource(errorMsg)) {
               return;
-            }
-
-            if (_currentEpisode != null && widget.detail?.videos.isNotEmpty == true) {""",
+            }""",
               "controller auto fallback",
           )
 
           replace_once(
-              """      if (!mounted) return;
-
-            // If we have an episode context (TV show), reopen the sources panel with error notice!""",
-              """      if (!mounted) return;
-
-            if (await _tryNextSource('Open failure: $e')) {
+              "      // If we have an episode context (TV show), reopen the sources panel with error notice!",
+              """      if (await _tryNextSource('Open failure: $e')) {
               return;
             }
 
