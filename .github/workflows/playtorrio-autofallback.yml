@@ -1,0 +1,334 @@
+name: Build PlayTorrio Auto-Fallback APK
+
+on:
+  push:
+    branches:
+      - playtorrio-autofallback-build
+    paths:
+      - .github/workflows/playtorrio-autofallback.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout PlayTorrio V3
+        uses: actions/checkout@v4
+        with:
+          repository: ayman708-UX/PlayTorrioV3
+          ref: 39b736ffb50a233b17852b0a8082427f8b989c36
+          path: playtorrio
+
+      - name: Patch automatic source fallback
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("playtorrio/lib/pages/player/player_screen.dart")
+          src = path.read_text(encoding="utf-8")
+
+          def replace_once(old: str, new: str, label: str):
+              global src
+              if old not in src:
+                  raise SystemExit(f"Patch anchor not found: {label}")
+              src = src.replace(old, new, 1)
+
+          replace_once(
+              "import '../../services/stream/torrent_stream_service.dart';",
+              "import '../../services/stream/torrent_stream_service.dart';\nimport '../../services/stream/stream_service.dart';",
+              "stream_service import",
+          )
+
+          replace_once(
+              """  final Map<String, List<StreamSource>> _cachedSourcesByEpisode = {};
+            String? _activeStreamUrl;
+            bool _wasFullscreenBeforeEntering = false;""",
+              """  final Map<String, List<StreamSource>> _cachedSourcesByEpisode = {};
+            String? _activeStreamUrl;
+
+            // Automatic source fallback: try the next result instead of forcing
+            // the user back to the source picker after a dead stream.
+            final Set<String> _failedSourceKeys = <String>{};
+            bool _autoFallbackInProgress = false;
+            int _autoFallbackCount = 0;
+            static const int _maxAutoFallbacks = 5;
+
+            bool _wasFullscreenBeforeEntering = false;""",
+              "fallback state",
+          )
+
+          fallback_methods = r'''
+            String _sourceKey(StreamSource source) {
+              if (source.infoHash != null && source.infoHash!.isNotEmpty) {
+                return 'hash:${source.infoHash!.toLowerCase()}';
+              }
+              if (source.url != null && source.url!.isNotEmpty) {
+                return 'url:${source.url}';
+              }
+              return 'meta:${source.addonName}|${source.name ?? ''}|${source.title ?? ''}';
+            }
+
+            Future<bool> _tryNextSource(String reason) async {
+              // A second player error can arrive while the first fallback lookup is
+              // still running. Treat that as already handled so it does not reopen
+              // the manual source panel over the top of the retry.
+              if (_autoFallbackInProgress) return true;
+              if (_autoFallbackCount >= _maxAutoFallbacks) return false;
+
+              final detail = widget.detail;
+              if (detail == null) return false;
+
+              _autoFallbackInProgress = true;
+              _failedSourceKeys.add(_sourceKey(_currentSource));
+
+              try {
+                if (mounted) {
+                  setState(() {
+                    _isLoading = true;
+                    _statusMessage =
+                        'Source failed • Finding the next stream...';
+                    _showSourcesPanel = false;
+                    _sourcesErrorMessage = null;
+                  });
+                }
+
+                final episode = _currentEpisode;
+                final isColl = detail.isCollection;
+                final streamId = episode?.id ?? detail.id;
+                final effectiveType = isColl ? 'movie' : detail.type;
+                final effectiveTitle =
+                    (isColl && episode != null && episode.title.isNotEmpty)
+                        ? episode.title
+                        : detail.name;
+                final epReleased = episode?.released;
+                final effectiveYear =
+                    (isColl && epReleased != null && epReleased.length >= 4)
+                        ? int.tryParse(epReleased.substring(0, 4))
+                        : int.tryParse(detail.year ?? '');
+                final effectiveSeason = isColl ? null : episode?.season;
+                final effectiveEpisode = isColl ? null : episode?.episode;
+
+                final candidates =
+                    await StreamService.fetchStreamsForTargetAddon(
+                  targetAddonName: _currentSource.addonName,
+                  type: effectiveType,
+                  id: streamId,
+                  title: effectiveTitle,
+                  year: effectiveYear,
+                  season: effectiveSeason,
+                  episode: effectiveEpisode,
+                  genres: detail.genres,
+                ).toList();
+
+                if (!mounted || candidates.isEmpty) return false;
+
+                final currentKey = _sourceKey(_currentSource);
+                final currentIndex =
+                    candidates.indexWhere((s) => _sourceKey(s) == currentKey);
+
+                StreamSource? nextSource;
+
+                // Prefer the next source in the exact order returned by the addon.
+                // For AIOStreams this preserves the user's 4K/quality/HDR sorting.
+                if (currentIndex >= 0) {
+                  for (var i = currentIndex + 1; i < candidates.length; i++) {
+                    final candidate = candidates[i];
+                    if (!_failedSourceKeys.contains(_sourceKey(candidate))) {
+                      nextSource = candidate;
+                      break;
+                    }
+                  }
+                }
+
+                // If the current source disappeared from a refreshed result set,
+                // or there was no later entry, use the first still-untried result.
+                if (nextSource == null) {
+                  for (final candidate in candidates) {
+                    if (!_failedSourceKeys.contains(_sourceKey(candidate))) {
+                      nextSource = candidate;
+                      break;
+                    }
+                  }
+                }
+
+                final fallbackSource = nextSource;
+                if (fallbackSource == null) return false;
+
+                _autoFallbackCount++;
+                final attempt = _autoFallbackCount;
+                if (mounted) {
+                  setState(() {
+                    _statusMessage =
+                        'Trying next source • fallback $attempt/$_maxAutoFallbacks';
+                  });
+                }
+
+                // Let the current error handler unwind before opening the next
+                // source. This avoids recursively handling player errors while
+                // the fallback lookup guard is still set.
+                scheduleMicrotask(() {
+                  if (mounted) {
+                    _switchToAutoFallbackSource(fallbackSource);
+                  }
+                });
+
+                debugPrint(
+                  '[PlayerAutoFallback] $reason -> '
+                  'trying ${fallbackSource.addonName}: '
+                  '${fallbackSource.title ?? fallbackSource.name ?? 'source'}',
+                );
+                return true;
+              } catch (e) {
+                debugPrint('[PlayerAutoFallback] Failed to find next source: $e');
+                return false;
+              } finally {
+                _autoFallbackInProgress = false;
+              }
+            }
+
+            void _switchToAutoFallbackSource(StreamSource newSource) {
+              _progressSaveTimer?.cancel();
+              _frameWatchdogTimer?.cancel();
+              _fallbackNoticeTimer?.cancel();
+              _fallbackNoticeText = null;
+
+              final prevVariant = _currentSubtitleVariant;
+              final wasSubEnabled = _isSubtitleEnabled;
+
+              setState(() {
+                _currentSource = newSource;
+                _isLoading = true;
+                _statusMessage =
+                    'Trying source ${_autoFallbackCount + 1}...';
+                _showEpisodesPanel = false;
+                _showSourcesPanel = false;
+                _sourcesErrorMessage = null;
+                _activeMenu = null;
+                _showSubSyncBar = false;
+                _showTextSyncOverlay = false;
+                _showSkipButton = false;
+                _activeSkipSegment = null;
+                _skipSegments = [];
+                _subtitleGroups = [];
+                _currentSubtitlePath = null;
+                _activeStreamUrl = null;
+                _currentCues = [];
+                _currentSubtitleVariant = prevVariant;
+                _isSubtitleEnabled = wasSubEnabled;
+              });
+
+              if (newSource.subtitles != null &&
+                  newSource.subtitles!.isNotEmpty) {
+                _loadSourceSubtitles(newSource.subtitles!);
+              }
+
+              TorrentStreamService().cleanup();
+              unawaited(_initStream());
+            }
+
+          '''
+
+          replace_once(
+              "  void _playNewSource(StreamSource newSource, Video episode) {",
+              fallback_methods + "  void _playNewSource(StreamSource newSource, Video episode) {",
+              "fallback methods",
+          )
+
+          replace_once(
+              """  void _switchStream(StreamSource newSource, Video newEpisode) async {
+            _progressSaveTimer?.cancel();""",
+              """  void _switchStream(StreamSource newSource, Video newEpisode) async {
+            _failedSourceKeys.clear();
+            _autoFallbackCount = 0;
+            _progressSaveTimer?.cancel();""",
+              "manual switch reset",
+          )
+
+          replace_once(
+              "  void _onControllerError(dynamic err) {",
+              "  Future<void> _onControllerError(dynamic err) async {",
+              "async controller error",
+          )
+
+          replace_once(
+              """    // 4. Critical error on dead stream
+            print('[PlayerScreen ERROR] Critical player error on dead stream: $errorMsg');
+
+            if (_currentEpisode != null && widget.detail?.videos.isNotEmpty == true) {""",
+              """    // 4. Critical error on dead stream
+            print('[PlayerScreen ERROR] Critical player error on dead stream: $errorMsg');
+
+            if (await _tryNextSource(errorMsg)) {
+              return;
+            }
+
+            if (_currentEpisode != null && widget.detail?.videos.isNotEmpty == true) {""",
+              "controller auto fallback",
+          )
+
+          replace_once(
+              """      if (!mounted) return;
+
+            // If we have an episode context (TV show), reopen the sources panel with error notice!""",
+              """      if (!mounted) return;
+
+            if (await _tryNextSource('Open failure: $e')) {
+              return;
+            }
+
+            // If we have an episode context (TV show), reopen the sources panel with error notice!""",
+              "init catch auto fallback",
+          )
+
+          path.write_text(src, encoding="utf-8")
+          print("Patched", path)
+          PY
+
+      - name: Verify patch markers
+        run: |
+          grep -n "PlayerAutoFallback" playtorrio/lib/pages/player/player_screen.dart
+          grep -n "_maxAutoFallbacks = 5" playtorrio/lib/pages/player/player_screen.dart
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.41.9'
+          channel: stable
+          cache: true
+
+      - name: Resolve dependencies
+        working-directory: playtorrio
+        run: flutter pub get
+
+      - name: Format patched Dart file
+        working-directory: playtorrio
+        run: dart format lib/pages/player/player_screen.dart
+
+      - name: Build release APK for modern Android (arm64)
+        working-directory: playtorrio
+        run: flutter build apk --release --target-platform android-arm64
+
+      - name: Stage APK
+        run: |
+          cp playtorrio/build/app/outputs/flutter-apk/app-release.apk PlayTorrioV3-AutoFallback-arm64.apk
+          ls -lh PlayTorrioV3-AutoFallback-arm64.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: PlayTorrioV3-AutoFallback-arm64
+          path: PlayTorrioV3-AutoFallback-arm64.apk
+          if-no-files-found: error
+          retention-days: 7
